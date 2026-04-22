@@ -772,116 +772,121 @@ function Game({ onGameOver }: { onGameOver: (score: number) => void }) {
     ctx.fillStyle = hGrad;
     ctx.fillRect(0, horizY - 30, W, 40);
 
-    // ── Дорога (псевдо-3D) — ближние внизу, дальние у горизонта ──
+    // ── Дорога (псевдо-3D) ──
+    // Логика: экран разбит на строки от HORIZON_Y (верх=даль) до H (низ=близко).
+    // Каждая строка экрана соответствует одному сегменту.
+    // Чем ниже строка — тем шире дорога и крупнее объекты.
     const camZ = s.pos;
-    const camX = s.playerX * ROAD_W;
     const startSeg = Math.floor(camZ / SEG_LEN);
+    const roadH = H - HORIZON_Y; // высота дорожной зоны в пикселях
 
-    // Простая прямая проекция: каждый сегмент n → строка экрана
-    // n=0 (ближний) → y=H (низ), n=VISIBLE (дальний) → y=HORIZON_Y (верх)
-    const segData: Array<{ seg: Seg; y1: number; y2: number; x1: number; x2: number; w1: number; w2: number; fogAmt: number }> = [];
+    type SegEntry = { seg: Seg; yTop: number; yBot: number; xTop: number; xBot: number; wTop: number; wBot: number; depth: number };
+    const segData: SegEntry[] = [];
 
-    let xOffset = 0; // смещение по X из-за изгибов
+    let curveX = 0; // накопленный сдвиг от изгибов
 
     for (let n = 0; n < VISIBLE; n++) {
       const segIdx = (startSeg + n) % NUM_SEGS;
       const seg = TRACK[segIdx];
 
-      // Линейное масштабирование: n=0 → y=H, n=VISIBLE → y=HORIZON_Y
-      const t1 = n / VISIBLE;
-      const t2 = (n + 1) / VISIBLE;
+      // depth: 0=ближний (низ экрана), 1=дальний (горизонт)
+      const d0 = n / VISIBLE;
+      const d1 = (n + 1) / VISIBLE;
 
-      // Перспективный масштаб (больше у низа, меньше у горизонта)
-      const scale1 = 1 - t1;
-      const scale2 = 1 - t2;
+      // Перспектива: используем 1/z — чем дальше, тем меньше
+      // Экранная Y: ближний → H, дальний → HORIZON_Y
+      const yBot = HORIZON_Y + roadH * (1 - d0);   // нижняя граница сегмента
+      const yTop = HORIZON_Y + roadH * (1 - d1);   // верхняя граница сегмента
 
-      const y1 = HORIZON_Y + (H - HORIZON_Y) * (1 - t1);
-      const y2 = HORIZON_Y + (H - HORIZON_Y) * (1 - t2);
+      // Ширина дороги: перспектива 1/z → пропорционально расстоянию от горизонта
+      const scaleBot = (yBot - HORIZON_Y) / roadH;  // 1 у низа, 0 у горизонта
+      const scaleTop = (yTop - HORIZON_Y) / roadH;
 
-      // Ширина полотна: широкая внизу, узкая у горизонта
-      const roadHalfW1 = ROAD_W * 0.0012 * (H - y1 + 20);
-      const roadHalfW2 = ROAD_W * 0.0012 * (H - y2 + 20);
+      const wBot = scaleBot * W * 0.75;
+      const wTop = scaleTop * W * 0.75;
 
-      // Горизонтальный сдвиг от кривой и позиции игрока
-      const cx = W / 2 - s.playerX * 160 * scale1 + xOffset * scale1 * 0.4;
-      xOffset += seg.curve * (1 - t1) * 2.5;
+      // Изгиб: накапливается с глубиной, влияет на X центра дороги
+      const xBot = W / 2 + curveX * scaleBot - s.playerX * scaleBot * 200;
+      curveX += seg.curve * 3;
+      const xTop = W / 2 + curveX * scaleTop - s.playerX * scaleTop * 200;
 
-      const cx2 = W / 2 - s.playerX * 160 * scale2 + xOffset * scale2 * 0.4;
-
-      segData.push({
-        seg,
-        y1, y2,
-        x1: cx, x2: cx2,
-        w1: roadHalfW1, w2: roadHalfW2,
-        fogAmt: t1 * 0.9,
-      });
+      segData.push({ seg, yTop, yBot, xTop, xBot, wTop, wBot, depth: d0 });
     }
 
-    // Рисуем с дальних (индекс конца массива = горизонт) к ближним (индекс 0 = низ)
+    // Рисуем от ДАЛЬНИХ (n=VISIBLE, горизонт) к БЛИЖНИМ (n=0, низ)
+    // → segData[VISIBLE-1] = дальний, segData[0] = ближний
+    // → рисуем segData от конца к началу
     for (let i = segData.length - 1; i >= 0; i--) {
-      const { seg, y1, y2, x1, x2, w1, w2, fogAmt } = segData[i];
+      const { seg, yTop, yBot, xTop, xBot, wTop, wBot, depth } = segData[i];
       const isLight = seg.color === 'light';
 
-      // Обочины
-      const rumbleW1 = w1 * 1.55;
-      const rumbleW2 = w2 * 1.55;
-      drawQuad(ctx, isLight ? C.grass1 : C.grass2, x1, y1, rumbleW1 + 60, x2, y2, rumbleW2 + 60);
+      // Обочина (трава)
+      drawQuad(ctx, isLight ? C.grass1 : C.grass2,
+        xTop, yTop, wTop * 1.6,
+        xBot, yBot, wBot * 1.6);
 
-      // Бордюр
-      drawQuad(ctx, isLight ? C.rumble : C.rumbleAlt, x1, y1, rumbleW1, x2, y2, rumbleW2);
+      // Бордюр (румбл)
+      drawQuad(ctx, isLight ? C.rumble : C.rumbleAlt,
+        xTop, yTop, wTop * 1.15,
+        xBot, yBot, wBot * 1.15);
 
       // Асфальт
-      drawQuad(ctx, isLight ? C.roadLight : C.road, x1, y1, w1, x2, y2, w2);
+      drawQuad(ctx, isLight ? C.roadLight : C.road,
+        xTop, yTop, wTop,
+        xBot, yBot, wBot);
 
-      // Центральная линия
+      // Разметка центральная
       if (isLight) {
-        drawQuad(ctx, C.line, x1, y1, w1 * 0.04, x2, y2, w2 * 0.04);
+        drawQuad(ctx, C.line,
+          xTop, yTop, wTop * 0.03,
+          xBot, yBot, wBot * 0.03);
       }
 
-      // Полосы
+      // Боковые полосы
       if (isLight) {
         for (const side of [-1, 1]) {
-          drawQuad(ctx, 'rgba(255,255,255,0.18)',
-            x1 + side * w1 * 0.33, y1, w1 * 0.015,
-            x2 + side * w2 * 0.33, y2, w2 * 0.015);
+          drawQuad(ctx, 'rgba(255,255,255,0.2)',
+            xTop + side * wTop * 0.6, yTop, wTop * 0.012,
+            xBot + side * wBot * 0.6, yBot, wBot * 0.012);
         }
       }
 
-      // Туман вдаль
-      if (fogAmt > 0.05) {
-        drawQuad(ctx, C.fog + fogAmt + ')', x1, y1, rumbleW1 + 60, x2, y2, rumbleW2 + 60);
+      // Туман (дальние сегменты затухают)
+      if (depth > 0.1) {
+        drawQuad(ctx, C.fog + (depth * 0.85) + ')',
+          xTop, yTop, wTop * 1.6,
+          xBot, yBot, wBot * 1.6);
       }
     }
 
-    // ── Трафик впереди (проецируем в дорогу) ──
+    // ── Трафик впереди ──
+    const roadH2 = H - HORIZON_Y;
     for (const t of s.traffic) {
       const tz = t.z - s.pos;
       if (tz <= 0 || tz > VISIBLE * SEG_LEN) continue;
-      // n = сегмент впереди
-      const n = tz / SEG_LEN;
-      const tNorm = Math.min(1, n / VISIBLE);
-      const screenY = HORIZON_Y + (H - HORIZON_Y) * (1 - tNorm) - 14;
-      const roadHalfW = ROAD_W * 0.0012 * (H - screenY + 20);
-      const screenX = W / 2 - s.playerX * 160 * (1 - tNorm) + t.lane * roadHalfW * 0.55;
-      const sc = Math.max(0.05, (1 - tNorm) * 0.9);
+      const depth = Math.min(1, (tz / SEG_LEN) / VISIBLE);
+      // depth=0 → внизу (близко), depth=1 → у горизонта
+      const screenY = HORIZON_Y + roadH2 * (1 - depth);
+      const scaleH = (screenY - HORIZON_Y) / roadH2; // 0..1, 1=низ
+      const roadW = scaleH * W * 0.75;
+      const screenX = W / 2 + t.lane * roadW * 0.55 - s.playerX * scaleH * 200;
+      const sc = Math.max(0.05, scaleH * 0.85);
       drawTrafficCar(ctx, screenX, screenY, sc, t.color);
     }
 
-    // ── Полицейские позади ──
+    // ── Полицейские позади (между игроком и низом) ──
     for (const cop of s.cops) {
-      const tz = cop.z; // отрицательный = позади
-      if (tz >= 0) continue;
-      const dist = Math.abs(tz);
-      if (dist > 2400) continue;
-      // Чем ближе коп → ближе к низу экрана (рядом с игроком)
-      const tNorm = Math.min(1, dist / 2000);
-      const screenY = H - 20 - tNorm * 180;
-      const scale = Math.max(0.15, 1 - tNorm * 0.75);
-      const screenX = W / 2 + cop.x * W * 0.3 * scale;
+      const dist = Math.abs(cop.z);
+      if (cop.z >= 0 || dist > 2200) continue;
+      const proximity = Math.max(0, 1 - dist / 2000); // 1=вплотную, 0=далеко
+      // Копы рисуются ниже игрока — чуть «за» ним
+      const screenY = H - 10 - proximity * 60;
+      const scale = 0.2 + proximity * 0.7;
+      const screenX = W / 2 + cop.x * 180 * scale;
       drawCopCar(ctx, screenX, screenY, scale, cop.siren);
     }
 
-    // ── Игрок (всегда внизу по центру) ──
+    // ── Игрок (низ экрана, по центру) ──
     drawPlayerCar(ctx, W / 2, s.tilt, s.shield);
 
     // ── Дождь ──
