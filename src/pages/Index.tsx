@@ -12,6 +12,7 @@ const SEG_LEN = 200;       // длина сегмента в мировых ед
 const CAM_DEPTH = 0.84;
 const ROAD_W = 2000;       // полуширина дороги в мировых единицах
 const LANE_W = ROAD_W * 2 / 3;
+const HORIZON_Y = H * 0.48; // горизонт на экране (откуда начинается дорога сверху)
 
 // Цвета
 const C = {
@@ -46,6 +47,8 @@ interface Projected {
 }
 
 // ═══════ Проекция ═══════
+// Ближние сегменты → низ экрана (большой scale)
+// Дальние сегменты → горизонт (HORIZON_Y, маленький scale)
 function project(
   worldX: number, worldY: number, worldZ: number,
   camX: number, camY: number, camZ: number,
@@ -55,8 +58,11 @@ function project(
   const transZ = worldZ - camZ;
   if (transZ <= 0) return { screen: { x: 0, y: 0, w: 0 }, world: { z: transZ }, scale: 0 };
   const scale = CAM_DEPTH / transZ;
-  const sx = (1 + scale * transX) * W / 2;
-  const sy = (1 - scale * transY) * H / 2;
+  // sx: горизонтальная позиция, центр W/2
+  const sx = W / 2 + scale * transX * W / 2;
+  // sy: дальние точки → HORIZON_Y (верх дороги), ближние → низ экрана
+  // scale большой = близко = низ; scale маленький = далеко = HORIZON_Y
+  const sy = HORIZON_Y + scale * transY * H - scale * 600;
   const sw = scale * ROAD_W * W / 2;
   return { screen: { x: sx, y: sy, w: sw }, world: { z: transZ }, scale };
 }
@@ -734,13 +740,17 @@ function Game({ onGameOver }: { onGameOver: (score: number) => void }) {
     const s = stateRef.current;
     ctx.clearRect(0, 0, W, H);
 
-    // ── Небо ──
-    const skyGrad = ctx.createLinearGradient(0, 0, 0, H * 0.55);
+    // ── Небо (верхняя часть до горизонта) ──
+    const skyGrad = ctx.createLinearGradient(0, 0, 0, HORIZON_Y);
     skyGrad.addColorStop(0, '#020210');
-    skyGrad.addColorStop(0.5, '#060320');
+    skyGrad.addColorStop(0.6, '#060320');
     skyGrad.addColorStop(1, '#0a0530');
     ctx.fillStyle = skyGrad;
-    ctx.fillRect(0, 0, W, H * 0.55);
+    ctx.fillRect(0, 0, W, HORIZON_Y);
+
+    // Земля под дорогой (нижняя часть) — тёмная
+    ctx.fillStyle = '#050510';
+    ctx.fillRect(0, HORIZON_Y, W, H - HORIZON_Y);
 
     // Звёзды
     ctx.fillStyle = '#ffffff';
@@ -754,7 +764,7 @@ function Game({ onGameOver }: { onGameOver: (score: number) => void }) {
     ctx.globalAlpha = 1;
 
     // Неоновый горизонт
-    const horizY = H * 0.52;
+    const horizY = HORIZON_Y;
     const hGrad = ctx.createLinearGradient(0, horizY - 30, 0, horizY + 10);
     hGrad.addColorStop(0, 'transparent');
     hGrad.addColorStop(0.5, s.danger > 0.5 ? `rgba(255,0,80,${s.danger * 0.6})` : 'rgba(0,100,255,0.3)');
@@ -762,113 +772,117 @@ function Game({ onGameOver }: { onGameOver: (score: number) => void }) {
     ctx.fillStyle = hGrad;
     ctx.fillRect(0, horizY - 30, W, 40);
 
-    // ── Дорога (псевдо-3D) ──
+    // ── Дорога (псевдо-3D) — ближние внизу, дальние у горизонта ──
     const camZ = s.pos;
     const camX = s.playerX * ROAD_W;
-    const camY = 1500;
     const startSeg = Math.floor(camZ / SEG_LEN);
 
-    let maxY = H;
-    let curveSum = 0;
+    // Простая прямая проекция: каждый сегмент n → строка экрана
+    // n=0 (ближний) → y=H (низ), n=VISIBLE (дальний) → y=HORIZON_Y (верх)
+    const segData: Array<{ seg: Seg; y1: number; y2: number; x1: number; x2: number; w1: number; w2: number; fogAmt: number }> = [];
 
-    const segData: Array<{ seg: Seg; p1: Projected; p2: Projected }> = [];
+    let xOffset = 0; // смещение по X из-за изгибов
 
     for (let n = 0; n < VISIBLE; n++) {
       const segIdx = (startSeg + n) % NUM_SEGS;
       const seg = TRACK[segIdx];
-      const worldZ1 = (startSeg + n) * SEG_LEN - camZ;
-      const worldZ2 = worldZ1 + SEG_LEN;
-      const hill = seg.startY;
 
-      const p1 = project(curveSum * ROAD_W * 0.01 - camX, hill + camY, worldZ1, 0, 0, 0);
-      curveSum += seg.curve;
-      const p2 = project(curveSum * ROAD_W * 0.01 - camX, hill + camY, worldZ2, 0, 0, 0);
+      // Линейное масштабирование: n=0 → y=H, n=VISIBLE → y=HORIZON_Y
+      const t1 = n / VISIBLE;
+      const t2 = (n + 1) / VISIBLE;
 
-      if (p1.scale <= 0 || p2.scale <= 0) continue;
-      if (p1.screen.y >= maxY) continue;
-      if (p2.screen.y < 0) continue;
+      // Перспективный масштаб (больше у низа, меньше у горизонта)
+      const scale1 = 1 - t1;
+      const scale2 = 1 - t2;
 
-      segData.push({ seg, p1, p2 });
+      const y1 = HORIZON_Y + (H - HORIZON_Y) * (1 - t1);
+      const y2 = HORIZON_Y + (H - HORIZON_Y) * (1 - t2);
+
+      // Ширина полотна: широкая внизу, узкая у горизонта
+      const roadHalfW1 = ROAD_W * 0.0012 * (H - y1 + 20);
+      const roadHalfW2 = ROAD_W * 0.0012 * (H - y2 + 20);
+
+      // Горизонтальный сдвиг от кривой и позиции игрока
+      const cx = W / 2 - s.playerX * 160 * scale1 + xOffset * scale1 * 0.4;
+      xOffset += seg.curve * (1 - t1) * 2.5;
+
+      const cx2 = W / 2 - s.playerX * 160 * scale2 + xOffset * scale2 * 0.4;
+
+      segData.push({
+        seg,
+        y1, y2,
+        x1: cx, x2: cx2,
+        w1: roadHalfW1, w2: roadHalfW2,
+        fogAmt: t1 * 0.9,
+      });
     }
 
-    // Рисуем с дальних к ближним
+    // Рисуем с дальних (индекс конца массива = горизонт) к ближним (индекс 0 = низ)
     for (let i = segData.length - 1; i >= 0; i--) {
-      const { seg, p1, p2 } = segData[i];
+      const { seg, y1, y2, x1, x2, w1, w2, fogAmt } = segData[i];
       const isLight = seg.color === 'light';
 
-      // Обочины (трава/неон)
-      const rumbleW = p1.screen.w * 1.6;
-      drawQuad(ctx, isLight ? C.grass1 : C.grass2,
-        p1.screen.x, p1.screen.y, rumbleW + 80,
-        p2.screen.x, p2.screen.y, rumbleW + 80);
+      // Обочины
+      const rumbleW1 = w1 * 1.55;
+      const rumbleW2 = w2 * 1.55;
+      drawQuad(ctx, isLight ? C.grass1 : C.grass2, x1, y1, rumbleW1 + 60, x2, y2, rumbleW2 + 60);
 
-      // Бордюр-румбл
-      drawQuad(ctx, isLight ? C.rumble : C.rumbleAlt,
-        p1.screen.x, p1.screen.y, rumbleW + 10,
-        p2.screen.x, p2.screen.y, rumbleW + 10);
+      // Бордюр
+      drawQuad(ctx, isLight ? C.rumble : C.rumbleAlt, x1, y1, rumbleW1, x2, y2, rumbleW2);
 
-      // Дорожное полотно
-      drawQuad(ctx, isLight ? C.roadLight : C.road,
-        p1.screen.x, p1.screen.y, p1.screen.w,
-        p2.screen.x, p2.screen.y, p2.screen.w);
+      // Асфальт
+      drawQuad(ctx, isLight ? C.roadLight : C.road, x1, y1, w1, x2, y2, w2);
 
-      // Разметка центральная
+      // Центральная линия
       if (isLight) {
-        drawQuad(ctx, C.line,
-          p1.screen.x, p1.screen.y, p1.screen.w * 0.04,
-          p2.screen.x, p2.screen.y, p2.screen.w * 0.04);
+        drawQuad(ctx, C.line, x1, y1, w1 * 0.04, x2, y2, w2 * 0.04);
       }
 
       // Полосы
-      const laneOff = p1.screen.w * 0.33;
       if (isLight) {
-        for (const lo of [-laneOff, laneOff]) {
-          drawQuad(ctx, 'rgba(255,255,255,0.15)',
-            p1.screen.x + lo, p1.screen.y, p1.screen.w * 0.015,
-            p2.screen.x + lo * (p2.screen.w / p1.screen.w), p2.screen.y, p2.screen.w * 0.015);
+        for (const side of [-1, 1]) {
+          drawQuad(ctx, 'rgba(255,255,255,0.18)',
+            x1 + side * w1 * 0.33, y1, w1 * 0.015,
+            x2 + side * w2 * 0.33, y2, w2 * 0.015);
         }
       }
 
-      // Туман (затухание вдаль)
-      const fogAmount = Math.max(0, (i / segData.length) * 0.85);
-      drawQuad(ctx, C.fog + fogAmount + ')',
-        p1.screen.x, p1.screen.y, p1.screen.w * 1.8 + 80,
-        p2.screen.x, p2.screen.y, p2.screen.w * 1.8 + 80);
-
-      maxY = Math.min(maxY, p1.screen.y);
-    }
-
-    // ── Горизонт трафик (за дорогой) ──
-    // Рисуем трафик
-    for (const t of s.traffic) {
-      const tz = t.z - s.pos;
-      if (tz <= 0 || tz > VISIBLE * SEG_LEN) continue;
-      const seg = getSeg(t.z);
-      const worldX = t.lane * ROAD_W * 0.55;
-      const p = project(worldX - camX, seg.startY + camY, tz, 0, 0, 0);
-      if (p.scale > 0) {
-        drawTrafficCar(ctx, p.screen.x, p.screen.y, p.scale, t.color);
+      // Туман вдаль
+      if (fogAmt > 0.05) {
+        drawQuad(ctx, C.fog + fogAmt + ')', x1, y1, rumbleW1 + 60, x2, y2, rumbleW2 + 60);
       }
     }
 
-    // ── Полицейские ──
-    for (const cop of s.cops) {
-      const tz = cop.z;
-      if (tz >= 0) continue;
-      const absTz = Math.abs(tz);
-      if (absTz > VISIBLE * SEG_LEN) continue;
+    // ── Трафик впереди (проецируем в дорогу) ──
+    for (const t of s.traffic) {
+      const tz = t.z - s.pos;
+      if (tz <= 0 || tz > VISIBLE * SEG_LEN) continue;
+      // n = сегмент впереди
+      const n = tz / SEG_LEN;
+      const tNorm = Math.min(1, n / VISIBLE);
+      const screenY = HORIZON_Y + (H - HORIZON_Y) * (1 - tNorm) - 14;
+      const roadHalfW = ROAD_W * 0.0012 * (H - screenY + 20);
+      const screenX = W / 2 - s.playerX * 160 * (1 - tNorm) + t.lane * roadHalfW * 0.55;
+      const sc = Math.max(0.05, (1 - tNorm) * 0.9);
+      drawTrafficCar(ctx, screenX, screenY, sc, t.color);
+    }
 
-      // Позиция позади: z отрицательный (позади камеры) → не проектируется обычно
-      // Рисуем копа снизу экрана относительно расстояния
-      const dist = absTz;
-      const scale = Math.max(0.05, Math.min(1, 1.2 - dist / 1800));
-      const screenY = H - 30 - (1 - scale) * 180;
-      const screenX = W / 2 + cop.x * W * 0.38 * scale;
+    // ── Полицейские позади ──
+    for (const cop of s.cops) {
+      const tz = cop.z; // отрицательный = позади
+      if (tz >= 0) continue;
+      const dist = Math.abs(tz);
+      if (dist > 2400) continue;
+      // Чем ближе коп → ближе к низу экрана (рядом с игроком)
+      const tNorm = Math.min(1, dist / 2000);
+      const screenY = H - 20 - tNorm * 180;
+      const scale = Math.max(0.15, 1 - tNorm * 0.75);
+      const screenX = W / 2 + cop.x * W * 0.3 * scale;
       drawCopCar(ctx, screenX, screenY, scale, cop.siren);
     }
 
-    // ── Игрок ──
-    drawPlayerCar(ctx, W / 2 + s.playerX * 60, s.tilt, s.shield);
+    // ── Игрок (всегда внизу по центру) ──
+    drawPlayerCar(ctx, W / 2, s.tilt, s.shield);
 
     // ── Дождь ──
     ctx.strokeStyle = 'rgba(180,220,255,0.25)';
