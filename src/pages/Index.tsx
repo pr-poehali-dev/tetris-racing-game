@@ -601,6 +601,187 @@ function GameOver({ score, onRestart, onMenu }: { score: number; onRestart: () =
 }
 
 // ═══════════════════════════════════════
+//  ЗВУКОВОЙ ДВИЖОК (Web Audio API)
+// ═══════════════════════════════════════
+class SoundEngine {
+  ctx: AudioContext;
+  // Узлы постоянных звуков
+  engineOsc: OscillatorNode | null = null;
+  engineGain: GainNode | null = null;
+  nitroOsc: OscillatorNode | null = null;
+  nitroGain: GainNode | null = null;
+  sirenOsc1: OscillatorNode | null = null;
+  sirenOsc2: OscillatorNode | null = null;
+  sirenGain: GainNode | null = null;
+  sirenLfo: OscillatorNode | null = null;
+  masterGain: GainNode;
+
+  constructor() {
+    this.ctx = new AudioContext();
+    this.masterGain = this.ctx.createGain();
+    this.masterGain.gain.value = 0.5;
+    this.masterGain.connect(this.ctx.destination);
+  }
+
+  resume() { if (this.ctx.state === 'suspended') this.ctx.resume(); }
+
+  // ── Двигатель (постоянный гул) ──
+  startEngine() {
+    if (this.engineOsc) return;
+    this.engineGain = this.ctx.createGain();
+    this.engineGain.gain.value = 0;
+    this.engineGain.connect(this.masterGain);
+
+    // Основной тон
+    this.engineOsc = this.ctx.createOscillator();
+    this.engineOsc.type = 'sawtooth';
+    this.engineOsc.frequency.value = 80;
+    this.engineOsc.connect(this.engineGain);
+    this.engineOsc.start();
+
+    // Фильтр — даёт "рокот"
+    const filter = this.ctx.createBiquadFilter();
+    filter.type = 'lowpass';
+    filter.frequency.value = 400;
+    this.engineOsc.disconnect();
+    this.engineOsc.connect(filter);
+    filter.connect(this.engineGain);
+  }
+
+  updateEngine(speed: number, nitro: boolean) {
+    if (!this.engineOsc || !this.engineGain) return;
+    const t = this.ctx.currentTime;
+    const freq = 60 + speed * 5.5;
+    this.engineOsc.frequency.setTargetAtTime(freq, t, 0.1);
+    this.engineGain.gain.setTargetAtTime(nitro ? 0 : 0.18, t, 0.05);
+
+    // Нитро — отдельный высокий тон
+    if (nitro && !this.nitroOsc) {
+      this.nitroGain = this.ctx.createGain();
+      this.nitroGain.gain.value = 0.12;
+      this.nitroGain.connect(this.masterGain);
+      this.nitroOsc = this.ctx.createOscillator();
+      this.nitroOsc.type = 'sawtooth';
+      this.nitroOsc.frequency.value = freq * 2.2;
+      this.nitroOsc.connect(this.nitroGain);
+      this.nitroOsc.start();
+    } else if (!nitro && this.nitroOsc) {
+      this.nitroGain?.gain.setTargetAtTime(0, this.ctx.currentTime, 0.08);
+      setTimeout(() => { this.nitroOsc?.stop(); this.nitroOsc = null; this.nitroGain = null; }, 200);
+    }
+    if (this.nitroOsc) {
+      this.nitroOsc.frequency.setTargetAtTime(freq * 2.2, t, 0.1);
+      if (this.nitroGain) this.nitroGain.gain.setTargetAtTime(0.14, t, 0.05);
+    }
+  }
+
+  stopEngine() {
+    this.engineOsc?.stop(); this.engineOsc = null;
+    this.nitroOsc?.stop(); this.nitroOsc = null;
+  }
+
+  // ── Сирена полиции (woo-woo) ──
+  startSiren(danger: number) {
+    if (this.sirenOsc1) {
+      // Обновляем громкость по опасности
+      if (this.sirenGain) this.sirenGain.gain.setTargetAtTime(danger * 0.12, this.ctx.currentTime, 0.2);
+      return;
+    }
+    this.sirenGain = this.ctx.createGain();
+    this.sirenGain.gain.value = 0;
+    this.sirenGain.connect(this.masterGain);
+
+    // LFO для колебания частоты (woo-woo эффект)
+    this.sirenLfo = this.ctx.createOscillator();
+    this.sirenLfo.type = 'sine';
+    this.sirenLfo.frequency.value = 0.9;
+    const lfoGain = this.ctx.createGain();
+    lfoGain.gain.value = 120;
+    this.sirenLfo.connect(lfoGain);
+
+    this.sirenOsc1 = this.ctx.createOscillator();
+    this.sirenOsc1.type = 'square';
+    this.sirenOsc1.frequency.value = 660;
+    lfoGain.connect(this.sirenOsc1.frequency);
+    this.sirenOsc1.connect(this.sirenGain);
+
+    this.sirenLfo.start();
+    this.sirenOsc1.start();
+  }
+
+  updateSiren(danger: number) {
+    if (!this.sirenGain) return;
+    this.sirenGain.gain.setTargetAtTime(danger * 0.1, this.ctx.currentTime, 0.3);
+    if (this.sirenLfo) this.sirenLfo.frequency.setTargetAtTime(0.8 + danger * 0.8, this.ctx.currentTime, 0.2);
+  }
+
+  stopSiren() {
+    this.sirenOsc1?.stop(); this.sirenOsc1 = null;
+    this.sirenLfo?.stop(); this.sirenLfo = null;
+    this.sirenGain = null;
+  }
+
+  // ── Удар ──
+  playHit() {
+    const g = this.ctx.createGain();
+    g.gain.setValueAtTime(0.4, this.ctx.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, this.ctx.currentTime + 0.4);
+    g.connect(this.masterGain);
+
+    const buf = this.ctx.createBuffer(1, this.ctx.sampleRate * 0.4, this.ctx.sampleRate);
+    const data = buf.getChannelData(0);
+    for (let i = 0; i < data.length; i++) data[i] = (Math.random() * 2 - 1) * Math.pow(1 - i / data.length, 2);
+    const src = this.ctx.createBufferSource();
+    src.buffer = buf;
+
+    const filter = this.ctx.createBiquadFilter();
+    filter.type = 'bandpass';
+    filter.frequency.value = 180;
+    filter.Q.value = 0.5;
+
+    src.connect(filter);
+    filter.connect(g);
+    src.start();
+  }
+
+  // ── Нитро запуск ──
+  playNitroStart() {
+    const g = this.ctx.createGain();
+    g.gain.setValueAtTime(0.2, this.ctx.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, this.ctx.currentTime + 0.3);
+    g.connect(this.masterGain);
+    const osc = this.ctx.createOscillator();
+    osc.type = 'sawtooth';
+    osc.frequency.setValueAtTime(200, this.ctx.currentTime);
+    osc.frequency.exponentialRampToValueAtTime(800, this.ctx.currentTime + 0.25);
+    osc.connect(g);
+    osc.start();
+    osc.stop(this.ctx.currentTime + 0.3);
+  }
+
+  // ── Щит ──
+  playShield() {
+    const g = this.ctx.createGain();
+    g.gain.setValueAtTime(0.15, this.ctx.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, this.ctx.currentTime + 0.6);
+    g.connect(this.masterGain);
+    const osc = this.ctx.createOscillator();
+    osc.type = 'sine';
+    osc.frequency.setValueAtTime(400, this.ctx.currentTime);
+    osc.frequency.exponentialRampToValueAtTime(1200, this.ctx.currentTime + 0.4);
+    osc.connect(g);
+    osc.start();
+    osc.stop(this.ctx.currentTime + 0.6);
+  }
+
+  destroy() {
+    this.stopEngine();
+    this.stopSiren();
+    this.ctx.close();
+  }
+}
+
+// ═══════════════════════════════════════
 //  ИГРОВОЕ ПОЛЕ (Canvas)
 // ═══════════════════════════════════════
 function Game({ onGameOver }: { onGameOver: (score: number) => void }) {
@@ -608,6 +789,7 @@ function Game({ onGameOver }: { onGameOver: (score: number) => void }) {
   const stateRef = useRef<GameState>(initGame());
   const animRef = useRef<number>(0);
   const gameOverCalledRef = useRef(false);
+  const soundRef = useRef<SoundEngine | null>(null);
 
   // HUD состояние (React side, обновляем редко)
   const [hud, setHud] = useState({ score: 0, lives: 3, speed: 0, danger: 0, shield: false });
@@ -616,6 +798,16 @@ function Game({ onGameOver }: { onGameOver: (score: number) => void }) {
 
   useEffect(() => {
     const down = (e: KeyboardEvent) => {
+      // Инициализируем звук при первом нажатии (требование браузера)
+      if (!soundRef.current) {
+        soundRef.current = new SoundEngine();
+        soundRef.current.startEngine();
+      }
+      soundRef.current.resume();
+      // Нитро старт
+      if (e.key === ' ' && !keysRef.current.has(' ')) {
+        soundRef.current.playNitroStart();
+      }
       keysRef.current.add(e.key);
       if (e.key === ' ') e.preventDefault();
     };
@@ -671,15 +863,14 @@ function Game({ onGameOver }: { onGameOver: (score: number) => void }) {
     for (const cop of s.cops) {
       const copSpeed = s.speed * 0.75 + 6;
       cop.z += (s.speed - copSpeed) * SEG_LEN * 0.001 * f;
-      // Плавное преследование по X
       cop.x += (s.playerX * 0.6 - cop.x) * 0.015 * f;
 
-      // Столкновение копа
       if (cop.z > -300 && Math.abs(cop.x - s.playerX) < 0.4) {
         if (!s.shield && s.hitCooldown <= 0) {
           s.lives--;
           s.hitCooldown = 3000;
           cop.z = -900 - Math.random() * 500;
+          soundRef.current?.playHit();
           if (s.lives <= 0 && !gameOverCalledRef.current) {
             gameOverCalledRef.current = true;
             onGameOver(s.score);
@@ -688,10 +879,9 @@ function Game({ onGameOver }: { onGameOver: (score: number) => void }) {
       }
     }
 
-    // Cooldown
     if (s.hitCooldown > 0) s.hitCooldown -= dt;
 
-    // Трафик движется
+    // Трафик
     for (const t of s.traffic) {
       t.z += s.speed * SEG_LEN * 0.001 * f;
       if (t.z > s.pos + 12000) {
@@ -699,7 +889,6 @@ function Game({ onGameOver }: { onGameOver: (score: number) => void }) {
         t.lane = [-1, 0, 1][Math.floor(Math.random() * 3)];
         t.color = TRAFFIC_COLORS[Math.floor(Math.random() * TRAFFIC_COLORS.length)];
       }
-      // Столкновение с трафиком
       const tz = t.z - s.pos;
       if (tz > -SEG_LEN * 0.5 && tz < SEG_LEN * 0.5) {
         const tx = t.lane * 0.65;
@@ -707,6 +896,7 @@ function Game({ onGameOver }: { onGameOver: (score: number) => void }) {
           if (!s.shield) {
             s.lives--;
             s.hitCooldown = 2000;
+            soundRef.current?.playHit();
             if (s.lives <= 0 && !gameOverCalledRef.current) {
               gameOverCalledRef.current = true;
               onGameOver(s.score);
@@ -729,10 +919,20 @@ function Game({ onGameOver }: { onGameOver: (score: number) => void }) {
     const minCopZ = Math.min(...s.cops.map(c => Math.abs(c.z)));
     s.danger = Math.max(0, Math.min(1, 1 - minCopZ / 1200));
 
-    // Случайный щит-бонус
+    // Звук двигателя и сирены
+    const snd = soundRef.current;
+    if (snd) {
+      const nitroOn = keys.has(' ') && s.speed > 20;
+      snd.updateEngine(s.speed, nitroOn);
+      snd.updateSiren(s.danger);
+      snd.startSiren(s.danger);
+    }
+
+    // Щит-бонус
     if (s.frame % 600 === 0 && !s.shield) {
       s.shield = true;
       s.shieldTimer = 5000;
+      soundRef.current?.playShield();
     }
   }, [onGameOver]);
 
@@ -965,7 +1165,11 @@ function Game({ onGameOver }: { onGameOver: (score: number) => void }) {
     };
 
     animRef.current = requestAnimationFrame(loop);
-    return () => cancelAnimationFrame(animRef.current);
+    return () => {
+      cancelAnimationFrame(animRef.current);
+      soundRef.current?.destroy();
+      soundRef.current = null;
+    };
   }, [update, draw]);
 
   return (
